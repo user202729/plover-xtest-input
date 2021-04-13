@@ -35,6 +35,18 @@ class XTESTKeyboard(Keyboard):
 class XTestSerialKeyboard(StenotypeBase):
     USED_KEYS = [chr(x) for x in range(ord('a'), ord('a')+16)] + ['z']
 
+	# this "machine" doesn't really have a key layout;
+	# rather, it reads directly from system.KEYS
+	# this is just to suppress the warning
+
+    KEYS_LAYOUT = '''
+        #  #  #  #  #  #  #  #  #  #
+        S- T- P- H- * -F -P -L -T -D
+        S- K- W- R- * -R -B -G -S -Z
+               A- O- -E -U
+    '''
+    KEYMAP_MACHINE_TYPE = 'TX Bolt'
+
     def __init__(self, params: dict)->None:
         assert not params
         super().__init__()
