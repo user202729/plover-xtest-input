@@ -1,35 +1,127 @@
 from typing import Optional
 
-from Xlib.ext import xinput
+from collections import OrderedDict
+from pathlib import Path
+from threading import Thread, Lock
+from queue import Queue
+import json
+import asyncio
+
+from plover.machine.base import StenotypeBase
+from plover.misc import boolean
+from plover.oslayer.keyboardcontrol import KeyboardCapture
+from plover.steno import Stroke
+from plover.oslayer.config import CONFIG_DIR
+
+from Xlib import X, XK
+from Xlib.display import Display
+from Xlib.ext import xinput, xtest
+from Xlib.ext.ge import GenericEventCode
+
+XINPUT_EVENT_MASK = xinput.KeyPressMask | xinput.KeyReleaseMask
 
 from plover.machine.base import StenotypeBase
 from plover.machine.keyboard import Keyboard
-from plover.oslayer.xkeyboardcontrol import KeyboardCapture
+try:
+    from plover.oslayer.linux.keyboardcontrol_x11 import KeyboardCapture, KEY_TO_KEYCODE
+except ImportError:
+    from plover.oslayer.xkeyboardcontrol import KeyboardCapture, KEY_TO_KEYCODE
 from plover import system
 
 
 class XTESTKeyboardCapture(KeyboardCapture):
-    def _update_devices(self)->None:
+    def _update_devices(self, display)->bool:
         self._devices = [
                 devinfo.deviceid
-                for devinfo in self._display.xinput_query_device(xinput.AllDevices).devices
+                for devinfo in display.xinput_query_device(xinput.AllDevices).devices
                 if 'Virtual core XTEST keyboard' == devinfo.name
                 ]
+        self._window = display.screen().root
+        print(self._devices)
+        return True
+ 
+    def _grab_key(self, keycode):
+        for deviceid in self._devices:
+            self._window.xinput_grab_keycode(deviceid,
+                                             X.CurrentTime,
+                                             keycode,
+                                             xinput.GrabModeAsync,
+                                             xinput.GrabModeAsync,
+                                             True,
+                                             XINPUT_EVENT_MASK,
+                                             (0, X.Mod2Mask))
+
+    def _ungrab_key(self, keycode):
+        for deviceid in self._devices:
+            self._window.xinput_ungrab_keycode(deviceid,
+                                               keycode,
+                                               (0, X.Mod2Mask))
+
+    def _suppress_keys(self, suppressed_keys):
+        suppressed_keys = set(suppressed_keys)
+        if self._suppressed_keys == suppressed_keys:
+            return
+        for key in self._suppressed_keys - suppressed_keys:
+            self._ungrab_key(KEY_TO_KEYCODE[key])
+            self._suppressed_keys.remove(key)
+        for key in suppressed_keys - self._suppressed_keys:
+            self._grab_key(KEY_TO_KEYCODE[key])
+            self._suppressed_keys.add(key)
+        assert self._suppressed_keys == suppressed_keys
 
 
 class XTESTKeyboard(Keyboard):
     def start_capture(self)->None:
+        """Begin listening for output from the stenotype machine."""
         self._initializing()
+        self._current_state_index = 0
+        """
+        The variable above is used to detect if a combination is held for long enough, it works as follows.
+
+        Whenever the set _down_keys changes, a timer is set to be fired in some time duration (e.g. 0.1 seconds).
+        If the set _down_keys has not changed the whole time, and it is a special action,
+        then the action is fired.
+
+        In order to detect if the set changed within the given time duration, the state index is increased
+        for every change of _down_keys.
+        """
+        self._current_state = None
+        self._current_task = None
+        self._loop = asyncio.new_event_loop()
+        self._stroke_on_release = None
+        self._events = Queue()
+        self._lock = Lock()
+        self._thread_object = Thread(target=self._thread_fn)
+        self._thread_object.start()
+
+        # idea: hold TPWHR for holding shift etc.
+        self._special_actions = {}
+        import itertools
+        for i in itertools.product(
+                (Stroke(0), Stroke("T")),
+                (Stroke(0), Stroke("K")),
+                (Stroke(0), Stroke("A")),
+                (Stroke(0), Stroke("O")),
+                ):
+            s=sum(i, Stroke("PWR*"))
+            self._special_actions[s] = (s|Stroke("-FBLSD"), s|Stroke("-RPGTZ"))
+            self._special_actions[s-Stroke("*")+Stroke("#")] = (s|Stroke("-FBLSD"), s|Stroke("-RPGTZ"))  # starboard stuff…
+
         try:
-            self._keyboard_capture: Optional[KeyboardCapture] = XTESTKeyboardCapture()
+            self._keyboard_capture = XTESTKeyboardCapture()
+            self._keyboard_capture.on_ready = self._ready
+            self._keyboard_capture.on_error = self._error
             self._keyboard_capture.key_down = self._key_down
+            #self._keyboard_capture.key_up = self._delayed_key_up
             self._keyboard_capture.key_up = self._key_up
-            self._suppress()
-            self._keyboard_capture.start()
+            if self._keyboard_capture.start():
+                self._ready()
+            else:
+                self._error()
+            self._update_suppression()
         except:
             self._error()
             raise
-        self._ready()
 
 
 class XTestSerialKeyboard(StenotypeBase):
